@@ -1,4 +1,6 @@
 import json
+from copy import deepcopy
+import mimetypes
 import logging
 import re
 import numpy as np
@@ -10,13 +12,18 @@ from bs4 import BeautifulSoup
 from nlm_ingestor.file_parser import pdf_file_parser
 from timeit import default_timer
 from .visual_ingestor import visual_ingestor
+from .google_ocr import GoogleOCR,convert_document_to_hocr
 from nlm_ingestor.ingestor.visual_ingestor.new_indent_parser import NewIndentParser
 from nlm_ingestor.ingestor_utils.utils import NpEncoder, \
     detect_block_center_aligned, detect_block_center_of_page
 from nlm_ingestor.ingestor_utils import utils
+import os
+from .logger import get_logger
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+_api_endpoint = os.environ.get("API_ENDPOINT", "")
+_access_token = os.environ.get("ACCESS_TOKEN", "")
+g_ocr = GoogleOCR(_access_token, _api_endpoint)
+logger = get_logger(__name__)
 text_only_pattern = re.compile(r"[^a-zA-Z]+")
 
 class PDFIngestor:
@@ -31,7 +38,6 @@ class PDFIngestor:
             if parse_options else False
         
         tika_html_doc = parse_pdf(doc_location, parse_options)
-        # print("tika_html_doc", tika_html_doc)
         blocks, _block_texts, _sents, _file_data, result, page_dim, num_pages = parse_blocks(
             tika_html_doc,
             render_format=render_format,
@@ -74,15 +80,104 @@ def parse_pdf(doc_location, parse_options):
 
     else:
         wall_time = default_timer() * 1000
-        parsed_content = pdf_file_parser.parse_to_html(doc_location, do_ocr=True)
+        name = doc_location.split('.')[0].split('/')[-1]
+        logger.warning(f"process_doc name:{name}")
+        ## dev
+        print("i was here@parse_pdf:parse_pdf")
+        mimetype = mimetypes.types_map['.'+doc_location.split('.')[-1]]
+        doc_obj = g_ocr.request_pylib(doc_location, mime_type=mimetype)
+        hocr = convert_document_to_hocr(doc_obj, name).replace("\'", '"')
+        with open("/hocr_google.hocr","w") as f:
+            f.write(hocr)
+        ## bypass
+        # with open("/hocr_google_edited.hocr","r") as f:
+        #     logger.info("bypass api request")
+        #     hocr = f.read()
+        
+        hocr = refine_hocr(hocr)
+        with open("/refined_hocr.html", 'w') as f:
+            f.write(hocr)
+        parsed_content = {'content': hocr, "title": name}
+
+        ## old
+        # parsed_content = pdf_file_parser.parse_to_html(doc_location, do_ocr=True)
+        # parsed_content = {'content': hocr, "title": name}
+
+        ## real
+
+        with open("/parsed_content.txt", 'w') as f:
+            f.write(str(parsed_content))
         parse_and_apply_hocr(parsed_content)
+        with open("/parsed_content_after.txt", 'w') as f:
+            f.write(json.dumps(parsed_content,indent=2))
         logger.info(
             f"PDF OCR finished in {default_timer() * 1000 - wall_time:.4f}ms on workspace",
         )
     return parsed_content
-        
+
+
+def refine_hocr(hocr_str,):
+    logger.info("start refine_hocr")
+    soup = BeautifulSoup(str(hocr_str), "html.parser")
+    # get title
+    logger.warning(f"title:{soup.head.title.get_text()}")
+    logger.warning(f"title:{soup.head.title}")
+    title_content = soup.head.title.get_text()
+    new_meta = soup.new_tag('meta',**{'content':title_content})
+    new_meta.attrs['name'] = "dc:title"
+    soup.head.append(new_meta)
+
+    meta_tags = soup.find_all("meta")
+    for tag in meta_tags:
+        if tag.attrs.get('name',None) is None:
+            tag.attrs['name'] = "fake_name"
+
+    # get page bbox
+    ocr_page_div = soup.find('div', class_='ocr_page')
+    title_attr = ocr_page_div.get('title')
+    bbox_str = ""
+    for v in title_attr.split(';'):
+        if 'bbox' in v:
+            bbox_str = v
+    if bbox_str == "":
+        logger.warning("ocr_page's bbox is not found for refining")
+    bbox = [int(value) for value in bbox_str.split()[1:]]
+    # change structure
+    new_div = soup.new_tag('div', **{'class': 'page', 'style': 'height:{:.2f}px; width:{:.1f}px; position: relative;border: 1px solid red;'.format(bbox[3],bbox[2])})
+    new_svg = soup.new_tag('svg', width='{:.1f}'.format(bbox[2]), height='{:.1f}'.format(bbox[3]))
+    new_ocr = soup.new_tag('div', **{'class': 'ocr'})
+    new_div.append(new_svg)
+    new_div.append(new_ocr)
+    new_ocr.append(deepcopy(soup.find('div', class_='ocr_page')))
+    soup.body.div.replace_with(new_div)
+    
+    # add x_size to line and remove line text content
+    lines = soup.find_all('span', class_='ocr_line')
+    for line_num, line in enumerate(lines):
+        line_attr = line.get('title')
+        bbox_str = ""
+        for v in line_attr.split(';'):
+            if 'bbox' in v:
+                bbox_str = v
+        bbox = [int(value) for value in bbox_str.split()[1:]]
+        line_title = line.attrs.get('title', '')
+        if len(line_title) != 0 and line_title[-1] != ";":
+            line_title += ';'
+        line_title += f" x_size {bbox[3]-bbox[1]};"
+        line.attrs['title'] = line_title
+        for content in line.contents:
+            if content.name != 'span':
+                content.extract()
+
+    html_str = str(soup.html)
+    logger.info("done refine_hocr")
+    return html_str
+
+
 
 def parse_and_apply_hocr(parsed_content):
+    logger.info("start parse_and_apply_hocr")
+
     def get_kv_from_attr(attr_str, sep=" "):
         #     print(attr_str)
         kv_string = attr_str.split(";")
@@ -98,20 +193,29 @@ def parse_and_apply_hocr(parsed_content):
 
     soup = BeautifulSoup(str(parsed_content), "html.parser")
     pages = soup.find_all("div", class_='page')
-    for page in pages:
+    if len(pages) == 0:
+        logger.error(f"len(pages)==0")
+    for page_num, page in enumerate(pages):
+        #logger.info(f"process_pages:{page_num}")
         page_kv = get_kv_from_attr(page.get('style'), ":")
         page_height = float(page_kv['height'].replace("px", ""))
         page_width = float(page_kv['width'].replace("px", ""))
         ocr_pages = page.find_all('div', class_='ocr_page')
+
         if len(ocr_pages) > 0:
             ocr_page = ocr_pages[0]
             ocr_page_kv = get_kv_from_attr(ocr_page.get('title'))
+            # logger.info(f"ocr_page_kv:{ocr_page_kv}")
             ocr_page_width = float(ocr_page_kv['bbox'][2])
             ocr_page_height = float(ocr_page_kv['bbox'][3])
             x_scale = page_width / ocr_page_width
             y_scale = page_height / ocr_page_height
+            # test
+            if x_scale != 1 or y_scale != 1:
+                logger.error(f"wrong scale x:{x_scale}, y:{y_scale}")
             lines = page.find_all('span', class_='ocr_line')
-            for line in lines:
+            for line_num, line in enumerate(lines):
+                #logger.info(f"process_P{page_num}_line:{line_num}")
                 title = line.get('title')
                 p_tag = soup.new_tag("p")
                 line_kv = get_kv_from_attr(title)
@@ -128,7 +232,8 @@ def parse_and_apply_hocr(parsed_content):
                 words = line.find_all('span', class_='ocrx_word')
                 word_start_positions = []
                 word_end_positions = []
-                for word in words:
+                for word_num, word in enumerate(words):
+                    # logger.info(f"process_P{page_num}_L{line_num}_W{word_num}")
                     word_kv = get_kv_from_attr(word.get('title'))
                     word_x0 = float(word_kv['bbox'][0]) * x_scale
                     word_y0 = float(word_kv['bbox'][1]) * y_scale
@@ -149,6 +254,7 @@ def parse_and_apply_hocr(parsed_content):
     html_str = html_str.replace("\\n", "")
     html_str = html_str.replace("\\t", "")
     parsed_content['content'] = html_str
+    logger.info("done parse_and_apply_hocr")
 
 def parse_blocks(
         tika_html_doc,
@@ -156,6 +262,7 @@ def parse_blocks(
         parse_pages: tuple = (),
         use_new_indent_parser: bool = False,
 ):
+    print("start parse_blocks")
     soup = BeautifulSoup(str(tika_html_doc), "html.parser")
     meta_tags = soup.find_all("meta")
     title = None

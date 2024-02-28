@@ -2,6 +2,12 @@
 FROM python:3.11-bookworm
 RUN apt-get update && apt-get -y --no-install-recommends install libgomp1
 ENV APP_HOME /app
+
+# for lsp
+RUN python -m venv /env
+ENV VIRTUAL_ENV /env
+ENV PATH /env/bin:$PATH
+
 # install Java
 RUN mkdir -p /usr/share/man/man1 && \
     apt-get update -y && \
@@ -33,4 +39,8 @@ RUN pip install -r requirements.txt
 RUN python -m nltk.downloader stopwords
 RUN python -m nltk.downloader punkt
 RUN chmod +x run.sh
-CMD ./run.sh
+RUN git clone https://github.com/tawat-ki/setup_dev_env /tmp/setup_dev_env
+RUN chmod +x /tmp/setup_dev_env/setup.sh
+RUN bash /tmp/setup_dev_env/setup.sh
+# CMD ./run.sh
+
